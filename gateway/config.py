@@ -530,6 +530,12 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["require_mention"] = platform_cfg["require_mention"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
+                if "bridge_port" in platform_cfg:
+                    bridged["bridge_port"] = platform_cfg["bridge_port"]
+                if "bridge_script" in platform_cfg:
+                    bridged["bridge_script"] = platform_cfg["bridge_script"]
+                if "session_path" in platform_cfg:
+                    bridged["session_path"] = platform_cfg["session_path"]
                 if not bridged:
                     continue
                 plat_data = platforms_data.setdefault(plat.value, {})
