@@ -48,9 +48,23 @@ def _run_boot_agent(content: str) -> None:
     """Spawn a one-shot agent session to execute the boot instructions."""
     try:
         from run_agent import AIAgent
+        from hermes_cli.config import load_config
+
+        # Read model/provider from config.yaml so we don't fall through to
+        # the hardcoded AIAgent default (openrouter / anthropic/claude-opus-4.6).
+        try:
+            _cfg = load_config()
+            _model_cfg = _cfg.get("model", {})
+            _model = _model_cfg.get("default") or None
+            _provider = _model_cfg.get("provider") or None
+        except Exception:
+            _model = None
+            _provider = None
 
         prompt = _build_boot_prompt(content)
         agent = AIAgent(
+            model=_model or "claude-sonnet-4-6",
+            provider=_provider or "anthropic",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,

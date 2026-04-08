@@ -7,8 +7,6 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent as an available model
-- POST /v1/runs                    — start a run, returns run_id immediately (202)
-- GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - GET  /health                     — health check
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
@@ -20,7 +18,6 @@ Requires:
 """
 
 import asyncio
-import hmac
 import json
 import logging
 import os
@@ -303,10 +300,6 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        # Active run streams: run_id -> asyncio.Queue of SSE event dicts
-        self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
-        # Creation timestamps for orphaned-run TTL sweep
-        self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
@@ -371,31 +364,13 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
-            if hmac.compare_digest(token, self._api_key):
+            if token == self._api_key:
                 return None  # Auth OK
 
         return web.json_response(
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
         )
-
-    # ------------------------------------------------------------------
-    # Session DB helper
-    # ------------------------------------------------------------------
-
-    def _ensure_session_db(self):
-        """Lazily initialise and return the shared SessionDB instance.
-
-        Sessions are persisted to ``state.db`` so that ``hermes sessions list``
-        shows API-server conversations alongside CLI and gateway ones.
-        """
-        if self._session_db is None:
-            try:
-                from hermes_state import SessionDB
-                self._session_db = SessionDB()
-            except Exception as e:
-                logger.debug("SessionDB unavailable for API server: %s", e)
-        return self._session_db
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -428,11 +403,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
-        # Load fallback provider chain so the API server platform has the
-        # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
-        from gateway.run import GatewayRunner
-        fallback_model = GatewayRunner._load_fallback_model()
-
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -445,8 +415,6 @@ class APIServerAdapter(BasePlatformAdapter):
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
-            session_db=self._ensure_session_db(),
-            fallback_model=fallback_model,
         )
         return agent
 
@@ -535,9 +503,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if provided_session_id:
             session_id = provided_session_id
             try:
-                db = self._ensure_session_db()
-                if db is not None:
-                    history = db.get_messages_as_conversation(session_id)
+                if self._session_db is None:
+                    from hermes_state import SessionDB
+                    self._session_db = SessionDB()
+                history = self._session_db.get_messages_as_conversation(session_id)
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
@@ -564,10 +533,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
-            def _on_tool_progress(event_type, name, preview, args, **kwargs):
+            def _on_tool_progress(name, preview, args):
                 """Inject tool progress into the SSE stream for Open WebUI."""
-                if event_type != "tool.started":
-                    return  # Only show tool start events in chat stream
                 if name.startswith("_"):
                     return  # Skip internal events (_thinking)
                 from agent.display import get_tool_emoji
@@ -818,29 +785,9 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
 
-        # Accept explicit conversation_history from the request body.
-        # This lets stateless clients supply their own history instead of
-        # relying on server-side response chaining via previous_response_id.
-        # Precedence: explicit conversation_history > previous_response_id.
+        # Reconstruct conversation history from previous_response_id
         conversation_history: List[Dict[str, str]] = []
-        raw_history = body.get("conversation_history")
-        if raw_history:
-            if not isinstance(raw_history, list):
-                return web.json_response(
-                    _openai_error("'conversation_history' must be an array of message objects"),
-                    status=400,
-                )
-            for i, entry in enumerate(raw_history):
-                if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
-                    return web.json_response(
-                        _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
-                        status=400,
-                    )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
-            if previous_response_id:
-                logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
-
-        if not conversation_history and previous_response_id:
+        if previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
@@ -997,18 +944,6 @@ class APIServerAdapter(BasePlatformAdapter):
             resume_job as _cron_resume,
             trigger_job as _cron_trigger,
         )
-        # Wrap as staticmethod to prevent descriptor binding — these are plain
-        # module functions, not instance methods.  Without this, self._cron_*()
-        # injects ``self`` as the first positional argument and every call
-        # raises TypeError.
-        _cron_list = staticmethod(_cron_list)
-        _cron_get = staticmethod(_cron_get)
-        _cron_create = staticmethod(_cron_create)
-        _cron_update = staticmethod(_cron_update)
-        _cron_remove = staticmethod(_cron_remove)
-        _cron_pause = staticmethod(_cron_pause)
-        _cron_resume = staticmethod(_cron_resume)
-        _cron_trigger = staticmethod(_cron_trigger)
         _CRON_AVAILABLE = True
     except ImportError:
         pass
@@ -1046,7 +981,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return cron_err
         try:
             include_disabled = request.query.get("include_disabled", "").lower() in ("true", "1")
-            jobs = self._cron_list(include_disabled=include_disabled)
+            from cron.jobs import list_jobs as _list_jobs_fn
+            jobs = _list_jobs_fn(include_disabled=include_disabled)
             return web.json_response({"jobs": jobs})
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
@@ -1329,269 +1265,458 @@ class APIServerAdapter(BasePlatformAdapter):
         return await loop.run_in_executor(None, _run)
 
     # ------------------------------------------------------------------
-    # /v1/runs — structured event streaming
+    # Kanban tasks API handlers
     # ------------------------------------------------------------------
 
-    _MAX_CONCURRENT_RUNS = 10  # Prevent unbounded resource allocation
-    _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
+    def _get_tasks_db_path(self) -> str:
+        import os
+        return os.path.join(os.path.expanduser("~"), ".hermes", "tasks.db")
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
-        def _push(event: Dict[str, Any]) -> None:
-            q = self._run_streams.get(run_id)
-            if q is None:
-                return
+    def _ensure_tasks_db(self):
+        """Ensure tasks table exists."""
+        import sqlite3, os
+        db_path = self._get_tasks_db_path()
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        conn.execute("""CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            column TEXT NOT NULL DEFAULT 'backlog',
+            priority TEXT NOT NULL DEFAULT 'medium',
+            assignee TEXT DEFAULT NULL,
+            tags TEXT DEFAULT '[]',
+            due_date TEXT DEFAULT NULL,
+            position INTEGER DEFAULT 0,
+            created_by TEXT DEFAULT 'user',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+        conn.commit()
+        conn.close()
+
+    def _task_row_to_dict(self, row, cursor) -> dict:
+        import json
+        cols = [d[0] for d in cursor.description]
+        task = dict(zip(cols, row))
+        if isinstance(task.get("tags"), str):
             try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
+                task["tags"] = json.loads(task["tags"])
             except Exception:
-                pass
+                task["tags"] = []
+        return task
 
-        def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
-            ts = time.time()
-            if event_type == "tool.started":
-                _push({
-                    "event": "tool.started",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "tool": tool_name,
-                    "preview": preview,
-                })
-            elif event_type == "tool.completed":
-                _push({
-                    "event": "tool.completed",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "tool": tool_name,
-                    "duration": round(kwargs.get("duration", 0), 3),
-                    "error": kwargs.get("is_error", False),
-                })
-            elif event_type == "reasoning.available":
-                _push({
-                    "event": "reasoning.available",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "text": preview or "",
-                })
-            # _thinking and subagent_progress are intentionally not forwarded
-
-        return _callback
-
-    async def _handle_runs(self, request: "web.Request") -> "web.Response":
-        """POST /v1/runs — start an agent run, return run_id immediately."""
+    async def _handle_list_tasks(self, request: "web.Request") -> "web.Response":
+        """GET /api/tasks"""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-
-        # Enforce concurrency limit
-        if len(self._run_streams) >= self._MAX_CONCURRENT_RUNS:
-            return web.json_response(
-                _openai_error(f"Too many concurrent runs (max {self._MAX_CONCURRENT_RUNS})", code="rate_limit_exceeded"),
-                status=429,
-            )
-
         try:
+            import sqlite3
+            self._ensure_tasks_db()
+            col_filter = request.query.get("column")
+            assignee_filter = request.query.get("assignee")
+            include_done = request.query.get("include_done", "true").lower() not in ("false", "0")
+            conn = sqlite3.connect(self._get_tasks_db_path())
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            query = "SELECT * FROM tasks WHERE 1=1"
+            params = []
+            if col_filter:
+                query += " AND column = ?"
+                params.append(col_filter)
+            if assignee_filter:
+                query += " AND assignee = ?"
+                params.append(assignee_filter)
+            if not include_done:
+                query += " AND column != 'done'"
+            query += " ORDER BY position ASC, created_at ASC"
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            import json as _json
+            tasks = []
+            for row in rows:
+                t = dict(row)
+                if isinstance(t.get("tags"), str):
+                    try:
+                        t["tags"] = _json.loads(t["tags"])
+                    except Exception:
+                        t["tags"] = []
+                tasks.append(t)
+            conn.close()
+            return web.json_response({"tasks": tasks})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_create_task(self, request: "web.Request") -> "web.Response":
+        """POST /api/tasks"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            import sqlite3, uuid, json as _json
+            from datetime import datetime, timezone
             body = await request.json()
-        except Exception:
-            return web.json_response(_openai_error("Invalid JSON"), status=400)
-
-        raw_input = body.get("input")
-        if not raw_input:
-            return web.json_response(_openai_error("Missing 'input' field"), status=400)
-
-        user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
-        if not user_message:
-            return web.json_response(_openai_error("No user message found in input"), status=400)
-
-        run_id = f"run_{uuid.uuid4().hex}"
-        loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
-        self._run_streams[run_id] = q
-        self._run_streams_created[run_id] = time.time()
-
-        event_cb = self._make_run_event_callback(run_id, loop)
-
-        # Also wire stream_delta_callback so message.delta events flow through
-        def _text_cb(delta: Optional[str]) -> None:
-            if delta is None:
-                return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
-            except Exception:
-                pass
-
-        instructions = body.get("instructions")
-        previous_response_id = body.get("previous_response_id")
-
-        # Accept explicit conversation_history from the request body.
-        # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, str]] = []
-        raw_history = body.get("conversation_history")
-        if raw_history:
-            if not isinstance(raw_history, list):
-                return web.json_response(
-                    _openai_error("'conversation_history' must be an array of message objects"),
-                    status=400,
-                )
-            for i, entry in enumerate(raw_history):
-                if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
-                    return web.json_response(
-                        _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
-                        status=400,
-                    )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
-            if previous_response_id:
-                logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
-
-        if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
-            if stored:
-                conversation_history = list(stored.get("conversation_history", []))
-                if instructions is None:
-                    instructions = stored.get("instructions")
-
-        # When input is a multi-message array, extract all but the last
-        # message as conversation history (the last becomes user_message).
-        # Only fires when no explicit history was provided.
-        if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
-            for msg in raw_input[:-1]:
-                if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
-                    content = msg["content"]
-                    if isinstance(content, list):
-                        # Flatten multi-part content blocks to text
-                        content = " ".join(
-                            part.get("text", "") for part in content
-                            if isinstance(part, dict) and part.get("type") == "text"
-                        )
-                    conversation_history.append({"role": msg["role"], "content": str(content)})
-
-        session_id = body.get("session_id") or run_id
-        ephemeral_system_prompt = instructions
-
-        async def _run_and_close():
-            try:
-                agent = self._create_agent(
-                    ephemeral_system_prompt=ephemeral_system_prompt,
-                    session_id=session_id,
-                    stream_delta_callback=_text_cb,
-                    tool_progress_callback=event_cb,
-                )
-                def _run_sync():
-                    r = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                    )
-                    u = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
-                    return r, u
-
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
-                final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                q.put_nowait({
-                    "event": "run.completed",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "output": final_response,
-                    "usage": usage,
-                })
-            except Exception as exc:
-                logger.exception("[api_server] run %s failed", run_id)
+            self._ensure_tasks_db()
+            task_id = body.get("id") or str(uuid.uuid4())[:8] + "-" + str(uuid.uuid4())[:3]
+            now = datetime.now(timezone.utc).isoformat()
+            tags = body.get("tags", [])
+            if isinstance(tags, list):
+                tags = _json.dumps(tags)
+            conn = sqlite3.connect(self._get_tasks_db_path())
+            conn.execute("""INSERT INTO tasks
+                (id, title, description, column, priority, assignee, tags, due_date, position, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (task_id,
+                 body.get("title", "Untitled"),
+                 body.get("description", ""),
+                 body.get("column", "backlog"),
+                 body.get("priority", "medium"),
+                 body.get("assignee"),
+                 tags,
+                 body.get("due_date"),
+                 body.get("position", 0),
+                 body.get("created_by", "user"),
+                 now, now))
+            conn.commit()
+            cursor = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+            row = cursor.fetchone()
+            task = dict(zip([d[0] for d in cursor.description], row))
+            if isinstance(task.get("tags"), str):
                 try:
-                    q.put_nowait({
-                        "event": "run.failed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "error": str(exc),
-                    })
+                    task["tags"] = _json.loads(task["tags"])
                 except Exception:
-                    pass
-            finally:
-                # Sentinel: signal SSE stream to close
-                try:
-                    q.put_nowait(None)
-                except Exception:
-                    pass
+                    task["tags"] = []
+            conn.close()
+            return web.json_response({"task": task}, status=201)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
 
-        task = asyncio.create_task(_run_and_close())
-        try:
-            self._background_tasks.add(task)
-        except TypeError:
-            pass
-        if hasattr(task, "add_done_callback"):
-            task.add_done_callback(self._background_tasks.discard)
-
-        return web.json_response({"run_id": run_id, "status": "started"}, status=202)
-
-    async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
-        """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
+    async def _handle_get_task(self, request: "web.Request") -> "web.Response":
+        """GET /api/tasks/{task_id}"""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-
-        run_id = request.match_info["run_id"]
-
-        # Allow subscribing slightly before the run is registered (race condition window)
-        for _ in range(20):
-            if run_id in self._run_streams:
-                break
-            await asyncio.sleep(0.05)
-        else:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
-
-        q = self._run_streams[run_id]
-
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
-        await response.prepare(request)
-
         try:
-            while True:
+            import sqlite3, json as _json
+            task_id = request.match_info["task_id"]
+            self._ensure_tasks_db()
+            conn = sqlite3.connect(self._get_tasks_db_path())
+            cursor = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+            row = cursor.fetchone()
+            if not row:
+                conn.close()
+                return web.json_response({"error": "Task not found"}, status=404)
+            task = dict(zip([d[0] for d in cursor.description], row))
+            if isinstance(task.get("tags"), str):
                 try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    await response.write(b": keepalive\n\n")
-                    continue
-                if event is None:
-                    # Run finished — send final SSE comment and close
-                    await response.write(b": stream closed\n\n")
-                    break
-                payload = f"data: {json.dumps(event)}\n\n"
-                await response.write(payload.encode())
-        except Exception as exc:
-            logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
-        finally:
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+                    task["tags"] = _json.loads(task["tags"])
+                except Exception:
+                    task["tags"] = []
+            conn.close()
+            return web.json_response({"task": task})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
 
-        return response
+    async def _handle_update_task(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/tasks/{task_id}"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            import sqlite3, json as _json
+            from datetime import datetime, timezone
+            task_id = request.match_info["task_id"]
+            body = await request.json()
+            self._ensure_tasks_db()
+            conn = sqlite3.connect(self._get_tasks_db_path())
+            allowed = {"title", "description", "column", "priority", "assignee", "tags", "due_date", "position"}
+            updates = {k: v for k, v in body.items() if k in allowed}
+            if not updates:
+                conn.close()
+                return web.json_response({"error": "No valid fields to update"}, status=400)
+            if "tags" in updates and isinstance(updates["tags"], list):
+                updates["tags"] = _json.dumps(updates["tags"])
+            updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            values = list(updates.values()) + [task_id]
+            conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
+            conn.commit()
+            cursor = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+            row = cursor.fetchone()
+            if not row:
+                conn.close()
+                return web.json_response({"error": "Task not found"}, status=404)
+            task = dict(zip([d[0] for d in cursor.description], row))
+            if isinstance(task.get("tags"), str):
+                try:
+                    task["tags"] = _json.loads(task["tags"])
+                except Exception:
+                    task["tags"] = []
+            conn.close()
+            return web.json_response({"task": task})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
 
-    async def _sweep_orphaned_runs(self) -> None:
-        """Periodically clean up run streams that were never consumed."""
-        while True:
-            await asyncio.sleep(60)
-            now = time.time()
-            stale = [
-                run_id
-                for run_id, created_at in list(self._run_streams_created.items())
-                if now - created_at > self._RUN_STREAM_TTL
-            ]
-            for run_id in stale:
-                logger.debug("[api_server] sweeping orphaned run %s", run_id)
-                self._run_streams.pop(run_id, None)
-                self._run_streams_created.pop(run_id, None)
+    async def _handle_delete_task(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/tasks/{task_id}"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            import sqlite3
+            task_id = request.match_info["task_id"]
+            self._ensure_tasks_db()
+            conn = sqlite3.connect(self._get_tasks_db_path())
+            conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            conn.commit()
+            conn.close()
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_move_task(self, request: "web.Request") -> "web.Response":
+        """POST /api/tasks/{task_id}/move"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            import sqlite3, json as _json
+            from datetime import datetime, timezone
+            task_id = request.match_info["task_id"]
+            body = await request.json()
+            column = body.get("column")
+            if not column:
+                return web.json_response({"error": "column required"}, status=400)
+            self._ensure_tasks_db()
+            now = datetime.now(timezone.utc).isoformat()
+            conn = sqlite3.connect(self._get_tasks_db_path())
+            conn.execute("UPDATE tasks SET column = ?, updated_at = ? WHERE id = ?", (column, now, task_id))
+            conn.commit()
+            cursor = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+            row = cursor.fetchone()
+            if not row:
+                conn.close()
+                return web.json_response({"error": "Task not found"}, status=404)
+            task = dict(zip([d[0] for d in cursor.description], row))
+            if isinstance(task.get("tags"), str):
+                try:
+                    task["tags"] = _json.loads(task["tags"])
+                except Exception:
+                    task["tags"] = []
+            conn.close()
+            return web.json_response({"task": task})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    # ------------------------------------------------------------------
+    # Sessions API handlers
+    # ------------------------------------------------------------------
+
+    def _get_session_db(self):
+        if self._session_db is None:
+            from hermes_state import SessionDB
+            self._session_db = SessionDB()
+        return self._session_db
+
+    async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            limit = int(request.query.get("limit", "50"))
+            offset = int(request.query.get("offset", "0"))
+            db = self._get_session_db()
+            sessions = db.list_sessions_rich(limit=limit, offset=offset)
+            total = db.session_count() if hasattr(db, 'session_count') else len(sessions)
+            return web.json_response({"sessions": sessions, "items": sessions, "total": total, "limit": limit, "offset": offset})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_search_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/search"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            q = request.query.get("q", "")
+            limit = int(request.query.get("limit", "20"))
+            db = self._get_session_db()
+            results = db.search_sessions(q, limit=limit) if q else []
+            return web.json_response({"sessions": results})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            session_id = request.match_info["session_id"]
+            db = self._get_session_db()
+            session = db.get_session(session_id)
+            if not session:
+                return web.json_response({"error": "Session not found"}, status=404)
+            return web.json_response({"session": session})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/sessions/{session_id}"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            session_id = request.match_info["session_id"]
+            db = self._get_session_db()
+            db.delete_session(session_id)
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_messages(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/messages"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            session_id = request.match_info["session_id"]
+            limit = int(request.query.get("limit", "100"))
+            db = self._get_session_db()
+            messages = db.get_messages(session_id, limit=limit)
+            return web.json_response({"messages": messages or []})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    # ------------------------------------------------------------------
+    # Skills API handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_list_skills(self, request: "web.Request") -> "web.Response":
+        """GET /api/skills"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from hermes_cli.skills_config import _list_all_skills
+            raw = _list_all_skills()
+            skills = []
+            for skill in raw:
+                skills.append({
+                    "id": skill.get("name", ""),
+                    "name": skill.get("name", ""),
+                    "description": skill.get("description", ""),
+                    "category": skill.get("category") or "Uncategorized",
+                    "tags": skill.get("tags", []),
+                    "triggers": skill.get("triggers", []),
+                    "sourcePath": skill.get("path", ""),
+                    "installed": True,
+                    "enabled": skill.get("enabled", True),
+                    "builtin": skill.get("builtin", False),
+                    "fileCount": skill.get("file_count", 0),
+                    "author": "",
+                    "homepage": None,
+                    "security": {"level": "safe", "flags": [], "score": 0},
+                    "content": skill.get("description", ""),
+                    "icon": "🔧",
+                })
+            return web.json_response({"skills": skills, "items": skills})
+        except Exception as e:
+            return web.json_response({"skills": [], "items": [], "error": str(e)}, status=200)
+
+    async def _handle_skill_categories(self, request: "web.Request") -> "web.Response":
+        """GET /api/skills/categories"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from hermes_cli.skills_config import _list_all_skills
+            raw = _list_all_skills()
+            categories = list({s.get("category") or "Uncategorized" for s in raw})
+            return web.json_response({"categories": sorted(categories)})
+        except Exception as e:
+            return web.json_response({"categories": [], "error": str(e)}, status=200)
+
+    async def _handle_get_skill(self, request: "web.Request") -> "web.Response":
+        """GET /api/skills/{skill_name}"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            skill_name = request.match_info["skill_name"]
+            from hermes_cli.skills_config import _list_all_skills
+            raw = _list_all_skills()
+            skill = next((s for s in raw if s.get("name") == skill_name), None)
+            if not skill:
+                return web.json_response({"error": "Skill not found"}, status=404)
+            return web.json_response({"skill": skill})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    # ------------------------------------------------------------------
+    # Config API handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_get_config(self, request: "web.Request") -> "web.Response":
+        """GET /api/config"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            import os, yaml as _yaml
+            config_path = os.path.join(os.path.expanduser("~"), ".hermes", "config.yaml")
+            config = {}
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    config = _yaml.safe_load(f) or {}
+            # Strip sensitive fields
+            for key in ("telegram", "discord", "whatsapp", "slack", "signal"):
+                config.pop(key, None)
+            return web.json_response(config)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_patch_config(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/config"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            import os, yaml as _yaml
+            body = await request.json()
+            config_path = os.path.join(os.path.expanduser("~"), ".hermes", "config.yaml")
+            config = {}
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    config = _yaml.safe_load(f) or {}
+            config.update(body)
+            with open(config_path, "w") as f:
+                _yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    # ------------------------------------------------------------------
+    # Memory API handler
+    # ------------------------------------------------------------------
+
+    async def _handle_get_memory(self, request: "web.Request") -> "web.Response":
+        """GET /api/memory"""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            import os
+            memory_path = os.path.join(os.path.expanduser("~"), ".hermes", "MEMORY.md")
+            content = ""
+            if os.path.exists(memory_path):
+                with open(memory_path) as f:
+                    content = f.read()
+            return web.json_response({"memory": content, "path": memory_path})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -1623,17 +1748,33 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
-            # Structured event streaming
-            self._app.router.add_post("/v1/runs", self._handle_runs)
-            self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
-            # Start background sweep to clean up orphaned (unconsumed) run streams
-            sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
-            try:
-                self._background_tasks.add(sweep_task)
-            except TypeError:
-                pass
-            if hasattr(sweep_task, "add_done_callback"):
-                sweep_task.add_done_callback(self._background_tasks.discard)
+
+            # Kanban tasks API
+            self._app.router.add_get("/api/tasks", self._handle_list_tasks)
+            self._app.router.add_post("/api/tasks", self._handle_create_task)
+            self._app.router.add_get("/api/tasks/{task_id}", self._handle_get_task)
+            self._app.router.add_patch("/api/tasks/{task_id}", self._handle_update_task)
+            self._app.router.add_delete("/api/tasks/{task_id}", self._handle_delete_task)
+            self._app.router.add_post("/api/tasks/{task_id}/move", self._handle_move_task)
+
+            # Sessions API
+            self._app.router.add_get("/api/sessions", self._handle_list_sessions)
+            self._app.router.add_get("/api/sessions/search", self._handle_search_sessions)
+            self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
+            self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
+            self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_get_messages)
+
+            # Skills API
+            self._app.router.add_get("/api/skills", self._handle_list_skills)
+            self._app.router.add_get("/api/skills/categories", self._handle_skill_categories)
+            self._app.router.add_get("/api/skills/{skill_name}", self._handle_get_skill)
+
+            # Config API
+            self._app.router.add_get("/api/config", self._handle_get_config)
+            self._app.router.add_patch("/api/config", self._handle_patch_config)
+
+            # Memory API
+            self._app.router.add_get("/api/memory", self._handle_get_memory)
 
             # Port conflict detection — fail fast if port is already in use
             import socket as _socket

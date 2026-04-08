@@ -661,6 +661,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+            skip_memory=bool(job.get("skip_memory", False)),
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run

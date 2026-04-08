@@ -529,6 +529,51 @@ def text_to_speech_tool(
             logger.info("Generating speech with MiniMax TTS...")
             _generate_minimax_tts(text, file_str, tts_config)
 
+        elif provider == "smallest":
+            smallest_config = tts_config.get("smallest", {})
+            api_key = smallest_config.get("api_key") or os.getenv("SMALLEST_API_KEY")
+            if not api_key:
+                return json.dumps({
+                    "success": False,
+                    "error": "Smallest provider selected but no API key found. Set tts.smallest.api_key in config.yaml or SMALLEST_API_KEY env var."
+                }, ensure_ascii=False)
+            logger.info("Generating speech with Smallest.ai...")
+            voice_id = smallest_config.get("voice_id", "emily")
+            model = smallest_config.get("model", "lightning-v3.1")
+            sample_rate = int(smallest_config.get("sample_rate", 24000))
+            speed = float(smallest_config.get("speed", 1.0))
+            # Use REST API directly — supports all models including lightning-v3.1
+            # (smallestai SDK validates against an outdated model list)
+            # Use httpx instead of requests — requests hangs on chunked transfer from smallest.ai
+            import httpx as _httpx
+            _api_url = f"https://api.smallest.ai/waves/v1/{model}/get_speech"
+            _payload = {
+                "voice_id": voice_id,
+                "text": text,
+                "sample_rate": sample_rate,
+                "speed": speed,
+                "output_format": "mp3",
+            }
+            _headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            try:
+                with _httpx.Client(timeout=15) as _client:
+                    _resp = _client.post(_api_url, json=_payload, headers=_headers)
+            except (_httpx.TimeoutException, _httpx.ConnectError, _httpx.NetworkError) as _net_err:
+                return json.dumps({
+                    "success": False,
+                    "error": f"Smallest.ai TTS unreachable (network error): {_net_err}"
+                }, ensure_ascii=False)
+            if _resp.status_code != 200:
+                return json.dumps({
+                    "success": False,
+                    "error": f"Smallest.ai API error {_resp.status_code}: {_resp.text[:300]}"
+                }, ensure_ascii=False)
+            with open(file_str, "wb") as f:
+                f.write(_resp.content)
+
         elif provider == "neutts":
             if not _check_neutts_available():
                 return json.dumps({
@@ -578,7 +623,7 @@ def text_to_speech_tool(
         # Try Opus conversion for Telegram compatibility
         # Edge TTS outputs MP3, NeuTTS outputs WAV — both need ffmpeg conversion
         voice_compatible = False
-        if provider in ("edge", "neutts", "minimax") and not file_str.endswith(".ogg"):
+        if provider in ("edge", "neutts", "minimax", "smallest") and not file_str.endswith(".ogg"):
             opus_path = _convert_to_opus(file_str)
             if opus_path:
                 file_str = opus_path
